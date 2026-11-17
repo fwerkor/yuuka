@@ -245,7 +245,10 @@ __device__ __forceinline__ void load_b_tile(__half * tile, const uint8_t * w,
     constexpr int kSpan = BlockK / kThreadsPerRow;
     constexpr int kRowsPerPass = kThreads / kThreadsPerRow;
     static_assert(BlockK % kThreadsPerRow == 0, "span must divide the K step");
-    static_assert(kSpan == 8 || kSpan == 16, "span decoder supports 8 or 16 values");
+    static_assert(kSpan == 8 || kSpan == 16 ||
+                  (kSpan == 32 && (DType == YUUKA_DTYPE_Q4_K ||
+                                   DType == YUUKA_DTYPE_Q5_K)),
+                  "unsupported quant weight span");
     if (DType == YUUKA_DTYPE_F32 || DType == YUUKA_DTYPE_F16) {
         for (int idx = threadIdx.x; idx < kBlockN * BlockK; idx += kThreads) {
             const int s = idx / BlockK;
@@ -265,7 +268,7 @@ __device__ __forceinline__ void load_b_tile(__half * tile, const uint8_t * w,
         }
         return;
     }
-    if (DType == YUUKA_DTYPE_Q6_K) {
+    if constexpr (DType == YUUKA_DTYPE_Q6_K) {
         static_assert(BlockK == 32, "the Q6_K span covers 32 K values per row");
         // Eight lanes cover one row and four values per lane, so a pass stages
         // 32 rows.
@@ -305,12 +308,22 @@ __device__ __forceinline__ void load_b_tile(__half * tile, const uint8_t * w,
         const int64_t remaining = in_range ? n_in - gk : 0;
         const int valid =
             in_range ? static_cast<int>(remaining < kSpan ? remaining : kSpan) : 0;
-        if (valid == kSpan) {
-            decode_span<DType, kSpan>(w + gn * row_bytes, gk, kSpan, dst);
-            continue;
-        }
-        if (valid > 0) {
-            decode_span<DType, kSpan>(w + gn * row_bytes, gk, valid, dst);
+        if constexpr (kSpan == 32) {
+            // A Q4_K block has 32-value scale/min subgroups. Reuse the
+            // existing vectorized 16-value decoder, staying within one
+            // subgroup while benchmarking a wider K tile.
+            if (valid > 0) {
+                decode_span<DType, 16>(w + gn * row_bytes, gk,
+                                       valid < 16 ? valid : 16, dst);
+            }
+            if (valid > 16) {
+                decode_span<DType, 16>(w + gn * row_bytes, gk + 16,
+                                       valid - 16, dst + 16);
+            }
+        } else {
+            if (valid > 0) {
+                decode_span<DType, kSpan>(w + gn * row_bytes, gk, valid, dst);
+            }
         }
         for (int j = valid; j < kSpan; ++j) {
             dst[j] = __float2half(0.0f);
@@ -658,6 +671,29 @@ void launch_wmma_swiglu_selected(float * out, const float * x,
 } // namespace
 
 namespace yuuka {
+
+// Built only by the optional MMQ probe; omitted from the production library.
+#ifdef YUUKA_MMQ_PROBE
+void launch_gemm_wmma_q4k_experiment(float * out, const float * x, const void * w,
+                                     uint64_t n_in, uint64_t n_out, uint64_t batch,
+                                     int variant, hipStream_t stream) {
+    if (!n_in || !n_out || !batch || n_in % 256) {
+        return;
+    }
+    const uint64_t row_bytes = packed_row_bytes(YUUKA_DTYPE_Q4_K, n_in);
+    const auto * src = static_cast<const uint8_t *>(w);
+    if (variant == 1) {
+        launch_wmma_tile<YUUKA_DTYPE_Q4_K, 64, 2, 64>(out, x, src, n_in, n_out,
+                                                      batch, row_bytes, stream);
+    } else if (variant == 2) {
+        launch_wmma_tile<YUUKA_DTYPE_Q4_K, 32, 1, 64>(out, x, src, n_in, n_out,
+                                                      batch, row_bytes, stream);
+    } else if (variant == 3) {
+        launch_wmma_tile<YUUKA_DTYPE_Q4_K, 32, 1, 128>(out, x, src, n_in, n_out,
+                                                       batch, row_bytes, stream);
+    }
+}
+#endif // YUUKA_MMQ_PROBE
 
 void launch_gemm_wmma_f32out(float * out, const float * x, const void * w,
                              uint64_t n_in, uint64_t n_out, uint64_t batch,

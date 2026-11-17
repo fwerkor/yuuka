@@ -7,6 +7,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 option(YUUKA_BUILD_TESTS "Build native tests" ON)
 option(YUUKA_BUILD_BENCH "Build native hardware benchmarks" ON)
+option(YUUKA_BUILD_MMQ_PROBE "Build standalone experimental MMQ comparison" OFF)
 option(YUUKA_ENABLE_HIP "Build the HIP backend" ON)
 
 if(YUUKA_ENABLE_HIP)
@@ -76,6 +77,18 @@ if(YUUKA_ENABLE_HIP)
 
         add_executable(yuuka_prefill_sweep bench/hip/prefill_sweep.cpp)
         target_link_libraries(yuuka_prefill_sweep PRIVATE yuuka_hip)
+
+        # Explicitly opt-in: MMQ experiments must not affect regular builds.
+        if(YUUKA_BUILD_MMQ_PROBE)
+            add_executable(yuuka_mmq_probe
+                bench/hip/mmq_probe.hip
+                kernels/hip/gemm/wmma_gemm.hip)
+            target_link_libraries(yuuka_mmq_probe PRIVATE hip::device roc::rocwmma)
+            target_compile_definitions(yuuka_mmq_probe PRIVATE YUUKA_MMQ_PROBE=1)
+            target_include_directories(yuuka_mmq_probe PRIVATE
+                ${CMAKE_CURRENT_SOURCE_DIR}/backend/hip/bridge
+                ${CMAKE_CURRENT_SOURCE_DIR}/kernels/hip)
+        endif()
 
         add_executable(yuuka_moe_sweep bench/hip/moe_sweep.cpp)
         target_link_libraries(yuuka_moe_sweep PRIVATE yuuka_hip)
